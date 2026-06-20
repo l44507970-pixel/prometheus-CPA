@@ -60,6 +60,7 @@ type OAuthCallbackRequest struct {
 // AuthFile 认证文件信息
 type AuthFile struct {
 	ID            string `json:"id"`
+	AuthIndex     string `json:"auth_index"`
 	Name          string `json:"name"`
 	Provider      string `json:"provider"`
 	Email         string `json:"email"`
@@ -74,6 +75,7 @@ type AuthFile struct {
 	ModTime       string `json:"modtime,omitempty"`
 	AccountType   string `json:"account_type,omitempty"`
 	Account       string `json:"account,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
 	CreatedAt     string `json:"created_at,omitempty"`
 	UpdatedAt     string `json:"updated_at,omitempty"`
 	LastRefresh   string `json:"last_refresh,omitempty"`
@@ -82,6 +84,22 @@ type AuthFile struct {
 // AuthFilesResponse 认证文件列表响应
 type AuthFilesResponse struct {
 	Files []AuthFile `json:"files"`
+}
+
+// APICallRequest 通过CPA管理接口代发一次探测请求
+type APICallRequest struct {
+	AuthIndex string            `json:"auth_index,omitempty"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Header    map[string]string `json:"header,omitempty"`
+	Data      string            `json:"data,omitempty"`
+}
+
+// APICallResponse CPA管理探测接口响应
+type APICallResponse struct {
+	StatusCode int                 `json:"status_code"`
+	Header     map[string][]string `json:"header"`
+	Body       string              `json:"body"`
 }
 
 // GetAntigravityAuthURL 获取Antigravity OAuth链接
@@ -327,6 +345,45 @@ func (c *Client) GetAuthFiles(ctx context.Context) (*AuthFilesResponse, error) {
 	}
 
 	var result AuthFilesResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse response failed: %w", err)
+	}
+
+	return &result, nil
+}
+
+// APICall 调用CPA管理接口，使用指定auth_index执行一次轻量探测
+func (c *Client) APICall(ctx context.Context, callReq *APICallRequest) (*APICallResponse, error) {
+	jsonBody, err := json.Marshal(callReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request failed: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v0/management/api-call", strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return nil, fmt.Errorf("create request failed: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.managementKey)
+	req.Header.Set("X-Management-Key", c.managementKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result APICallResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("parse response failed: %w", err)
 	}

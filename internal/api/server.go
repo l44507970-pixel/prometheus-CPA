@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -620,6 +621,211 @@ func findAuthFileByEmail(files []cpa.AuthFile, email, provider string) *cpa.Auth
 	return fallback
 }
 
+const (
+	antigravityProbeURL                   = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	antigravityProbeBody                  = `{"metadata":{"ideType":"ANTIGRAVITY"}}`
+	antigravityProbeUserAgent             = "antigravity/cli/1.0.8"
+	antigravityMissingProjectIDMessage    = "账号不可用：Antigravity 凭证缺少 project_id，请重新登录或在CPA刷新凭证后再试"
+	antigravityInsufficientCreditsMessage = "账号不可用：Antigravity 额度不足"
+)
+
+func (s *Server) authFileValidationMessage(ctx context.Context, file cpa.AuthFile) string {
+	if unavailableMessage := authFileUnavailableMessage(file); unavailableMessage != "" {
+		return unavailableMessage
+	}
+
+	if normalizeCredentialProvider(file.Provider) != "antigravity" {
+		return ""
+	}
+
+	authIndex := strings.TrimSpace(file.AuthIndex)
+	if authIndex == "" {
+		if strings.TrimSpace(file.ProjectID) == "" {
+			return antigravityMissingProjectIDMessage
+		}
+		return ""
+	}
+
+	resp, err := s.cpaClient.APICall(ctx, antigravityProbeRequest(authIndex))
+	if err != nil {
+		return "账号不可用：CPA探测失败：" + err.Error()
+	}
+
+	return antigravityAPICallUnavailableMessage(file, resp)
+}
+
+func antigravityProbeRequest(authIndex string) *cpa.APICallRequest {
+	return &cpa.APICallRequest{
+		AuthIndex: strings.TrimSpace(authIndex),
+		Method:    http.MethodPost,
+		URL:       antigravityProbeURL,
+		Header: map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Accept":        "*/*",
+			"Content-Type":  "application/json",
+			"User-Agent":    antigravityProbeUserAgent,
+		},
+		Data: antigravityProbeBody,
+	}
+}
+
+func antigravityAPICallUnavailableMessage(file cpa.AuthFile, resp *cpa.APICallResponse) string {
+	if resp == nil {
+		return "无法验证账号可用性：CPA未返回探测结果"
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Sprintf("账号不可用：Antigravity 探测失败（HTTP %d%s）", resp.StatusCode, apiCallErrorDetail(resp.Body))
+	}
+
+	data, ok := decodeJSONObject(resp.Body)
+	if !ok {
+		return "无法验证账号可用性：CPA探测返回异常"
+	}
+
+	if extractProjectID(data) == "" && strings.TrimSpace(file.ProjectID) == "" {
+		return antigravityMissingProjectIDMessage
+	}
+
+	if creditsMessage := antigravityCreditsUnavailableMessage(data); creditsMessage != "" {
+		return creditsMessage
+	}
+
+	return ""
+}
+
+func decodeJSONObject(body string) (map[string]any, bool) {
+	var data map[string]any
+	if err := json.Unmarshal([]byte(body), &data); err != nil {
+		return nil, false
+	}
+	return data, data != nil
+}
+
+func extractProjectID(data map[string]any) string {
+	for _, key := range []string{"cloudaicompanionProject", "projectId", "project"} {
+		if projectID := stringFromJSONValue(data[key]); projectID != "" {
+			return projectID
+		}
+		if nested, ok := data[key].(map[string]any); ok {
+			if projectID := stringFromJSONValue(nested["id"]); projectID != "" {
+				return projectID
+			}
+		}
+	}
+	return ""
+}
+
+func antigravityCreditsUnavailableMessage(data map[string]any) string {
+	paidTier, ok := data["paidTier"].(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	credits, ok := paidTier["availableCredits"].([]any)
+	if !ok {
+		return ""
+	}
+
+	for _, rawCredit := range credits {
+		credit, ok := rawCredit.(map[string]any)
+		if !ok || !strings.EqualFold(strings.TrimSpace(stringFromJSONValue(credit["creditType"])), "GOOGLE_ONE_AI") {
+			continue
+		}
+
+		amount, amountOK := floatFromJSONValue(credit["creditAmount"])
+		minAmount, minOK := floatFromJSONValue(credit["minimumCreditAmountForUsage"])
+		if amountOK && minOK && amount < minAmount {
+			return antigravityInsufficientCreditsMessage
+		}
+	}
+
+	return ""
+}
+
+func apiCallErrorDetail(body string) string {
+	detail := extractJSONErrorMessage(body)
+	if detail == "" {
+		detail = strings.TrimSpace(body)
+	}
+	if detail == "" {
+		return ""
+	}
+	return "：" + truncateRunes(detail, 240)
+}
+
+func extractJSONErrorMessage(body string) string {
+	data, ok := decodeJSONObject(body)
+	if !ok {
+		return ""
+	}
+
+	switch errValue := data["error"].(type) {
+	case string:
+		return strings.TrimSpace(errValue)
+	case map[string]any:
+		parts := []string{
+			stringFromJSONValue(errValue["message"]),
+			stringFromJSONValue(errValue["status"]),
+			stringFromJSONValue(errValue["code"]),
+		}
+		return strings.TrimSpace(strings.Join(nonEmptyStrings(parts), " "))
+	}
+
+	return strings.TrimSpace(stringFromJSONValue(data["message"]))
+}
+
+func stringFromJSONValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case map[string]any:
+		return stringFromJSONValue(typed["id"])
+	default:
+		return ""
+	}
+}
+
+func floatFromJSONValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case json.Number:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed.String()), 64)
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func nonEmptyStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
+}
+
 // authCompleteHandler 确认授权完成并生成CDK
 func (s *Server) authCompleteHandler(c *gin.Context) {
 	var req AuthCompleteRequest
@@ -723,7 +929,7 @@ func (s *Server) authCompleteHandler(c *gin.Context) {
 	}
 
 	if newAuthFile != nil {
-		if unavailableMessage := authFileUnavailableMessage(*newAuthFile); unavailableMessage != "" {
+		if unavailableMessage := s.authFileValidationMessage(ctx, *newAuthFile); unavailableMessage != "" {
 			s.deletePendingAuth(req.State)
 			c.JSON(http.StatusBadRequest, AuthStatusResponse{
 				Success: false,
@@ -928,7 +1134,7 @@ func (s *Server) iflowAuthHandler(c *gin.Context) {
 		})
 		return
 	}
-	if unavailableMessage := authFileUnavailableMessage(*authFile); unavailableMessage != "" {
+	if unavailableMessage := s.authFileValidationMessage(ctx, *authFile); unavailableMessage != "" {
 		c.JSON(http.StatusBadRequest, AuthStartResponse{
 			Success: false,
 			Message: unavailableMessage,
@@ -1158,6 +1364,7 @@ func (s *Server) deleteCredentialHandler(c *gin.Context) {
 
 type adminCPACredential struct {
 	ID            string `json:"id"`
+	AuthIndex     string `json:"auth_index"`
 	Name          string `json:"name"`
 	Provider      string `json:"provider"`
 	Email         string `json:"email"`
@@ -1169,6 +1376,7 @@ type adminCPACredential struct {
 	Source        string `json:"source"`
 	AccountType   string `json:"account_type,omitempty"`
 	Account       string `json:"account,omitempty"`
+	ProjectID     string `json:"project_id,omitempty"`
 	CreatedAt     string `json:"created_at,omitempty"`
 	UpdatedAt     string `json:"updated_at,omitempty"`
 	LastRefresh   string `json:"last_refresh,omitempty"`
@@ -1222,6 +1430,7 @@ func credentialSyncKey(provider, email string) string {
 func newAdminCPACredential(file cpa.AuthFile) *adminCPACredential {
 	return &adminCPACredential{
 		ID:            file.ID,
+		AuthIndex:     file.AuthIndex,
 		Name:          file.Name,
 		Provider:      file.Provider,
 		Email:         file.Email,
@@ -1233,6 +1442,7 @@ func newAdminCPACredential(file cpa.AuthFile) *adminCPACredential {
 		Source:        file.Source,
 		AccountType:   file.AccountType,
 		Account:       file.Account,
+		ProjectID:     file.ProjectID,
 		CreatedAt:     file.CreatedAt,
 		UpdatedAt:     file.UpdatedAt,
 		LastRefresh:   file.LastRefresh,
