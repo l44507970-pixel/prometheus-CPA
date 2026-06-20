@@ -275,6 +275,38 @@ func (db *DB) ListCredentials(limit, offset int) ([]*Credential, int, error) {
 	return credentials, total, nil
 }
 
+// ListAllCredentials 获取所有本地凭证，用于和CPA凭证做同步对比
+func (db *DB) ListAllCredentials() ([]*Credential, error) {
+	query := `
+		SELECT id, type, email, project_id, credential_hash, status, cdk_id, created_at, updated_at
+		FROM credentials
+		ORDER BY created_at DESC
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all credentials: %w", err)
+	}
+	defer rows.Close()
+
+	var credentials []*Credential
+	for rows.Next() {
+		cred := &Credential{}
+		err := rows.Scan(
+			&cred.ID, &cred.Type, &cred.Email, &cred.ProjectID, &cred.CredentialHash,
+			&cred.Status, &cred.CDKID, &cred.CreatedAt, &cred.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan credential: %w", err)
+		}
+		credentials = append(credentials, cred)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate credentials: %w", err)
+	}
+
+	return credentials, nil
+}
+
 // DeleteCredential 删除凭证，并清理本地关联关系
 func (db *DB) DeleteCredential(id int64) (int64, error) {
 	tx, err := db.Begin()

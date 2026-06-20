@@ -247,6 +247,34 @@
             color: var(--accent-color);
         }
 
+        .sync-summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .sync-chip {
+            background: var(--input-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: var(--text-secondary);
+            min-width: 120px;
+        }
+
+        .sync-chip strong {
+            display: block;
+            color: var(--text-primary);
+            font-size: 1.25rem;
+            line-height: 1.2;
+        }
+
+        .action-muted {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
         .pagination {
             display: flex;
             justify-content: center;
@@ -1000,6 +1028,7 @@
         <!-- 标签页 -->
         <div class="tabs">
             <button class="tab active" data-tab="credentials">凭证列表</button>
+            <button class="tab" data-tab="cpaCredentials">CPA凭证</button>
             <button class="tab" data-tab="cdks">CDK管理</button>
             <button class="tab" data-tab="groups">CDK分组</button>
             <button class="tab" data-tab="channels">渠道管理</button>
@@ -1030,6 +1059,40 @@
                         </tbody>
                     </table>
                     <div class="pagination" id="credentialsPagination"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CPA凭证对比 -->
+        <div class="tab-content" id="cpaCredentials">
+            <div class="section">
+                <div class="section-header">
+                    <h2>CPA凭证对比</h2>
+                    <button class="refresh-btn" onclick="loadCpaCredentials()">🔄 刷新</button>
+                </div>
+                <div class="section-body">
+                    <div class="sync-summary" id="cpaSyncSummary">
+                        <div class="sync-chip"><strong>-</strong>全部</div>
+                        <div class="sync-chip"><strong>-</strong>已同步</div>
+                        <div class="sync-chip"><strong>-</strong>仅CPA</div>
+                        <div class="sync-chip"><strong>-</strong>仅本地</div>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>同步状态</th>
+                                <th>Provider</th>
+                                <th>邮箱</th>
+                                <th>CPA状态</th>
+                                <th>CPA标记</th>
+                                <th>本地凭证</th>
+                                <th>更新时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="cpaCredentialsTable">
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -1259,6 +1322,7 @@
 
         let credentialsPage = 0;
         let cdksPage = 0;
+        let cpaCredentialsLoaded = false;
         const pageSize = 20;
 
         const htmlEscapeMap = {
@@ -1290,6 +1354,10 @@
                 
                 tab.classList.add('active');
                 document.getElementById(tab.dataset.tab).classList.add('active');
+
+                if (tab.dataset.tab === 'cpaCredentials' && !cpaCredentialsLoaded) {
+                    loadCpaCredentials();
+                }
             });
         });
 
@@ -1390,11 +1458,160 @@
                 if (response.ok) {
                     loadCredentials(nextPage);
                     loadStats();
+                    if (cpaCredentialsLoaded) loadCpaCredentials();
                 } else {
                     alert('删除失败: ' + result.error);
                 }
             } catch (error) {
                 alert('删除失败: ' + error.message);
+            }
+        }
+
+        function getSyncStatusMeta(status) {
+            switch (status) {
+                case 'synced':
+                    return { className: 'success', label: '已同步' };
+                case 'cpa_only':
+                    return { className: 'info', label: '仅CPA' };
+                case 'local_only':
+                    return { className: 'warning', label: '仅本地' };
+                default:
+                    return { className: 'info', label: status || '-' };
+            }
+        }
+
+        function renderCpaSyncSummary(stats = {}) {
+            document.getElementById('cpaSyncSummary').innerHTML = `
+                <div class="sync-chip"><strong>${safeNumber(stats.total)}</strong>全部</div>
+                <div class="sync-chip"><strong>${safeNumber(stats.synced)}</strong>已同步</div>
+                <div class="sync-chip"><strong>${safeNumber(stats.cpa_only)}</strong>仅CPA</div>
+                <div class="sync-chip"><strong>${safeNumber(stats.local_only)}</strong>仅本地</div>
+            `;
+        }
+
+        function getCpaFlags(cpa) {
+            if (!cpa) return '-';
+            const flags = [];
+            if (cpa.disabled) flags.push('<span class="badge badge-error">disabled</span>');
+            if (cpa.unavailable) flags.push('<span class="badge badge-warning">unavailable</span>');
+            if (cpa.runtime_only) flags.push('<span class="badge badge-info">runtime</span>');
+            if (cpa.source) flags.push(`<span class="badge badge-info">${escapeHtml(cpa.source)}</span>`);
+            return flags.length ? flags.join(' ') : '<span class="action-muted">无</span>';
+        }
+
+        function getCpaStatusText(cpa) {
+            if (!cpa) return '-';
+            const status = cpa.status || '-';
+            const message = cpa.status_message ? ` / ${cpa.status_message}` : '';
+            return escapeHtml(status + message);
+        }
+
+        function getLocalText(local) {
+            if (!local) return '<span class="action-muted">未入库</span>';
+            return `#${safeNumber(local.id)} <span class="badge badge-${getStatusClass(local.status)}">${escapeHtml(local.status)}</span>`;
+        }
+
+        function getSyncTime(item) {
+            const cpaTime = item.cpa?.updated_at || item.cpa?.last_refresh || item.cpa?.created_at;
+            const localTime = item.local?.updated_at || item.local?.created_at;
+            return cpaTime || localTime || '';
+        }
+
+        // 加载CPA凭证对比
+        async function loadCpaCredentials() {
+            const tbody = document.getElementById('cpaCredentialsTable');
+            cpaCredentialsLoaded = true;
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="8">
+                        <div class="empty-state">
+                            <div class="icon">⏳</div>
+                            <p>正在加载CPA凭证...</p>
+                        </div>
+                    </td>
+                </tr>
+            `;
+
+            try {
+                const response = await fetch('/api/admin/cpa-credentials');
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || '加载失败');
+                }
+
+                renderCpaSyncSummary(result.stats);
+
+                if (!result.data || result.data.length === 0) {
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="8">
+                                <div class="empty-state">
+                                    <div class="icon">📭</div>
+                                    <p>暂无CPA或本地凭证数据</p>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                    return;
+                }
+
+                tbody.innerHTML = result.data.map(item => {
+                    const meta = getSyncStatusMeta(item.match_status);
+                    const localId = item.local?.id ? safeNumber(item.local.id) : 0;
+                    const action = item.match_status === 'local_only' && localId > 0
+                        ? `<button class="refresh-btn" style="color: var(--error-text);" onclick="cleanupLocalCredential(${localId})">清理本地</button>`
+                        : '<span class="action-muted">无需操作</span>';
+
+                    return `
+                        <tr>
+                            <td><span class="badge badge-${meta.className}">${escapeHtml(meta.label)}</span></td>
+                            <td>${escapeHtml(item.provider || '-')}</td>
+                            <td>${escapeHtml(item.email || item.local?.email || item.cpa?.email || '-')}</td>
+                            <td>${getCpaStatusText(item.cpa)}</td>
+                            <td>${getCpaFlags(item.cpa)}</td>
+                            <td>${getLocalText(item.local)}</td>
+                            <td>${escapeHtml(formatDate(getSyncTime(item)))}</td>
+                            <td>${action}</td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (error) {
+                renderCpaSyncSummary();
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8">
+                            <div class="empty-state">
+                                <div class="icon">⚠️</div>
+                                <p>${escapeHtml(error.message)}</p>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }
+        }
+
+        // 清理CPA中已不存在的本地凭证
+        async function cleanupLocalCredential(id) {
+            if (!confirm('确定要清理这条本地残留凭证吗？此操作不会操作CPA。')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/admin/credentials/${id}`, {
+                    method: 'DELETE'
+                });
+                const result = await response.json();
+
+                if (response.ok) {
+                    await loadCpaCredentials();
+                    loadCredentials(credentialsPage);
+                    loadStats();
+                } else {
+                    alert('清理失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('清理失败: ' + error.message);
             }
         }
 
@@ -1537,6 +1754,7 @@
         function formatDate(dateStr) {
             if (!dateStr) return '-';
             const date = new Date(dateStr);
+            if (Number.isNaN(date.getTime())) return String(dateStr);
             return date.toLocaleString('zh-CN', {
                 year: 'numeric',
                 month: '2-digit',

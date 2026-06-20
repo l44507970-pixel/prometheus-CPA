@@ -167,6 +167,7 @@ func (s *Server) setupRoutes() {
 			admin.GET("/stats", s.statsHandler)
 			admin.GET("/credentials", s.listCredentialsHandler)
 			admin.DELETE("/credentials/:id", s.deleteCredentialHandler)
+			admin.GET("/cpa-credentials", s.listCPACredentialsHandler)
 			admin.GET("/cdks", s.listCDKsHandler)
 			admin.POST("/site-config", s.setSiteConfigHandler)
 
@@ -1053,6 +1054,194 @@ func (s *Server) deleteCredentialHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "凭证删除成功"})
+}
+
+type adminCPACredential struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Provider      string `json:"provider"`
+	Email         string `json:"email"`
+	Status        string `json:"status"`
+	StatusMessage string `json:"status_message"`
+	Disabled      bool   `json:"disabled"`
+	Unavailable   bool   `json:"unavailable"`
+	RuntimeOnly   bool   `json:"runtime_only"`
+	Source        string `json:"source"`
+	AccountType   string `json:"account_type,omitempty"`
+	Account       string `json:"account,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+	LastRefresh   string `json:"last_refresh,omitempty"`
+}
+
+type adminLocalCredential struct {
+	ID        int64                     `json:"id"`
+	Type      database.CredentialType   `json:"type"`
+	Email     string                    `json:"email"`
+	ProjectID string                    `json:"project_id"`
+	Status    database.CredentialStatus `json:"status"`
+	CDKID     *int64                    `json:"cdk_id,omitempty"`
+	CreatedAt time.Time                 `json:"created_at"`
+	UpdatedAt time.Time                 `json:"updated_at"`
+}
+
+type adminCPACredentialSyncItem struct {
+	Key         string                `json:"key"`
+	Provider    string                `json:"provider"`
+	Email       string                `json:"email"`
+	MatchStatus string                `json:"match_status"` // synced, cpa_only, local_only
+	CPA         *adminCPACredential   `json:"cpa,omitempty"`
+	Local       *adminLocalCredential `json:"local,omitempty"`
+}
+
+type adminCPACredentialSyncStats struct {
+	Total     int `json:"total"`
+	Synced    int `json:"synced"`
+	CPAOnly   int `json:"cpa_only"`
+	LocalOnly int `json:"local_only"`
+}
+
+func normalizeCredentialProvider(provider string) string {
+	normalized := strings.ToLower(strings.TrimSpace(provider))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	if normalized == "gemini" {
+		return "gemini_cli"
+	}
+	return normalized
+}
+
+func credentialSyncKey(provider, email string) string {
+	normalizedProvider := normalizeCredentialProvider(provider)
+	normalizedEmail := strings.ToLower(strings.TrimSpace(email))
+	if normalizedProvider == "" || normalizedEmail == "" {
+		return ""
+	}
+	return normalizedProvider + "|" + normalizedEmail
+}
+
+func newAdminCPACredential(file cpa.AuthFile) *adminCPACredential {
+	return &adminCPACredential{
+		ID:            file.ID,
+		Name:          file.Name,
+		Provider:      file.Provider,
+		Email:         file.Email,
+		Status:        file.Status,
+		StatusMessage: file.StatusMessage,
+		Disabled:      file.Disabled,
+		Unavailable:   file.Unavailable,
+		RuntimeOnly:   file.RuntimeOnly,
+		Source:        file.Source,
+		AccountType:   file.AccountType,
+		Account:       file.Account,
+		CreatedAt:     file.CreatedAt,
+		UpdatedAt:     file.UpdatedAt,
+		LastRefresh:   file.LastRefresh,
+	}
+}
+
+func newAdminLocalCredential(cred *database.Credential) *adminLocalCredential {
+	return &adminLocalCredential{
+		ID:        cred.ID,
+		Type:      cred.Type,
+		Email:     cred.Email,
+		ProjectID: cred.ProjectID,
+		Status:    cred.Status,
+		CDKID:     cred.CDKID,
+		CreatedAt: cred.CreatedAt,
+		UpdatedAt: cred.UpdatedAt,
+	}
+}
+
+// listCPACredentialsHandler 列出CPA凭证，并和本地凭证做同步状态对比
+func (s *Server) listCPACredentialsHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	authFiles, err := s.cpaClient.GetAuthFiles(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "获取CPA凭证失败: " + err.Error()})
+		return
+	}
+
+	localCredentials, err := s.db.ListAllCredentials()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	localByKey := make(map[string][]*database.Credential)
+	for _, cred := range localCredentials {
+		key := credentialSyncKey(string(cred.Type), cred.Email)
+		if key == "" {
+			continue
+		}
+		localByKey[key] = append(localByKey[key], cred)
+	}
+
+	usedLocal := make(map[int64]bool)
+	items := make([]adminCPACredentialSyncItem, 0, len(authFiles.Files)+len(localCredentials))
+	stats := adminCPACredentialSyncStats{}
+
+	for _, file := range authFiles.Files {
+		provider := normalizeCredentialProvider(file.Provider)
+		if provider == "" {
+			provider = "unknown"
+		}
+		key := credentialSyncKey(provider, file.Email)
+
+		item := adminCPACredentialSyncItem{
+			Key:         key,
+			Provider:    provider,
+			Email:       file.Email,
+			MatchStatus: "cpa_only",
+			CPA:         newAdminCPACredential(file),
+		}
+
+		if key != "" && len(localByKey[key]) > 0 {
+			local := localByKey[key][0]
+			localByKey[key] = localByKey[key][1:]
+			usedLocal[local.ID] = true
+
+			item.MatchStatus = "synced"
+			item.Local = newAdminLocalCredential(local)
+			stats.Synced++
+		} else {
+			stats.CPAOnly++
+		}
+
+		items = append(items, item)
+	}
+
+	for _, cred := range localCredentials {
+		if usedLocal[cred.ID] {
+			continue
+		}
+
+		provider := normalizeCredentialProvider(string(cred.Type))
+		if provider == "" {
+			provider = "unknown"
+		}
+		key := credentialSyncKey(provider, cred.Email)
+		if key == "" {
+			key = fmt.Sprintf("local:%d", cred.ID)
+		}
+
+		items = append(items, adminCPACredentialSyncItem{
+			Key:         key,
+			Provider:    provider,
+			Email:       cred.Email,
+			MatchStatus: "local_only",
+			Local:       newAdminLocalCredential(cred),
+		})
+		stats.LocalOnly++
+	}
+
+	stats.Total = len(items)
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":  items,
+		"stats": stats,
+	})
 }
 
 // listCDKsHandler 列出CDK
